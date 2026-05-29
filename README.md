@@ -13,7 +13,7 @@ sudo bash haproxy.sh --install
 If you are installing from GitHub for the first time:
 
 ```bash
-sudo bash <(curl -Ls --ipv4 https://github.com/Musixal/haproxy/raw/main/haproxy.sh) --install
+sudo bash <(curl -Ls --ipv4 https://github.com/0fariid0/haproxy/raw/main/haproxy.sh) --install
 ```
 
 After the first install, open the menu any time with:
@@ -64,6 +64,4 @@ If the shortcut is deleted or broken:
 sudo haproxy-menu --repair-shortcut
 ```
 
-### Menu
 
-![Menu](https://github.com/Musixal/haproxy/blob/main/menu.png)
