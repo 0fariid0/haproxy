@@ -1,36 +1,24 @@
-## HAProxy Menu v2.3 - editable tunnel manager
+## HAProxy Menu v2.6 - grouped editable tunnel manager
 
-This v2.3 version installs locally once, creates a shortcut, and adds an editable tunnel manager so you can add, edit, enable/disable, and delete HAProxy tunnels from the menu without rewriting everything by hand.
+This version installs locally once, creates a shortcut, and adds grouped editable tunnels.
+A tunnel is now saved as one named group, with one destination IP/domain and one list of listen/destination ports.
 
-### Important install fix
+### Safe one-time install from GitHub
 
-Do **not** install with this pattern on VPS images where `/dev/fd` is unavailable or where `sudo` closes file descriptors:
-
-```bash
-sudo bash <(curl -Ls --ipv4 https://github.com/0fariid0/haproxy/raw/main/haproxy.sh) --install
-```
-
-It can fail with:
-
-```text
-bash: /dev/fd/63: No such file or directory
-```
-
-Use the safe one-time download method below instead.
-
-### One-time install from GitHub
+Do not use `bash <(curl ...)` on VPS images where `/dev/fd` is unavailable or where `sudo` closes file descriptors.
+Use this instead:
 
 ```bash
 curl -4 -fsSL https://raw.githubusercontent.com/0fariid0/haproxy/main/haproxy.sh -o /tmp/haproxy.sh && sudo bash /tmp/haproxy.sh --install
 ```
 
-If you are already logged in as root:
+If you are already root:
 
 ```bash
 curl -4 -fsSL https://raw.githubusercontent.com/0fariid0/haproxy/main/haproxy.sh -o /tmp/haproxy.sh && bash /tmp/haproxy.sh --install
 ```
 
-After the first install, open the menu any time with:
+After the first install, open the menu with:
 
 ```bash
 sudo hapmenu
@@ -42,78 +30,67 @@ or:
 sudo haproxy-menu
 ```
 
-
-### If your menu still shows v2.0
-
-That means the old script is still installed locally or GitHub was not updated yet. Replace `haproxy.sh` in the repository with this v2.3 file, then run:
-
-```bash
-rm -f /opt/haproxy-menu/haproxy.sh /usr/local/bin/hapmenu /usr/local/bin/haproxy-menu
-curl -4 -fsSL "https://raw.githubusercontent.com/0fariid0/haproxy/main/haproxy.sh?$(date +%s)" -o /tmp/haproxy.sh
-grep -E "APP_VERSION|Manage Editable Tunnels|editable tunnels" /tmp/haproxy.sh
-bash /tmp/haproxy.sh --install
-```
-
-The `grep` output must show `APP_VERSION="2.3"` before you install. If it still shows `2.0`, GitHub still has the old file.
-
 ### Manual update on the server
 
-If you copy `haproxy.sh` to the server manually, copying it into `/root` is not enough. The shortcut runs this installed file:
+If you copy `haproxy.sh` manually to the server, copying it to `/root` is not enough. The shortcut runs:
 
 ```bash
 /opt/haproxy-menu/haproxy.sh
 ```
 
-Use this after uploading the new file to `/tmp/haproxy.sh`:
+After uploading the new file to `/tmp/haproxy.sh`, run:
 
 ```bash
 install -Dm755 /tmp/haproxy.sh /opt/haproxy-menu/haproxy.sh
 ln -sf /opt/haproxy-menu/haproxy.sh /usr/local/bin/hapmenu
 ln -sf /opt/haproxy-menu/haproxy.sh /usr/local/bin/haproxy-menu
 hash -r
-grep -E 'APP_VERSION|Manage Editable Tunnels' /opt/haproxy-menu/haproxy.sh
 hapmenu --version
 ```
 
+The output must show:
 
-### Local paths
-
-The script is installed locally at:
-
-```bash
-/opt/haproxy-menu/haproxy.sh
+```text
+haproxy-menu v2.6
 ```
 
-Shortcuts are created at:
+### Tunnel database
 
-```bash
-/usr/local/bin/hapmenu
-/usr/local/bin/haproxy-menu
-```
-
-Editable tunnel records are stored at:
+Editable tunnel groups are stored at:
 
 ```bash
 /etc/haproxy/haproxy-tunnels.db
 ```
 
-Tunnel file format:
+Format:
 
 ```text
-name|bind_port|destination_host|destination_port|enabled
+name|listen_ports|destination_host|destination_ports|enabled
 ```
 
 Example:
 
 ```text
-iran-443|443|1.2.3.4|443|1
-iran-8443|8443|example.com|8443|1
-backup-ipv6|2096|2001:db8::10|443|0
+1|31,1030,27028,39464,56855|10.20.1.2|31,1030,27028,39464,56855|1
 ```
 
-`enabled` can be `1` or `0`. Enabled tunnels are written into `/etc/haproxy/haproxy.cfg` when you choose **Apply/rebuild HAProxy config from saved tunnels**.
+That means one tunnel group named `1` with these mappings:
 
-### Editable tunnel manager
+```text
+31    -> 10.20.1.2:31
+1030  -> 10.20.1.2:1030
+27028 -> 10.20.1.2:27028
+39464 -> 10.20.1.2:39464
+56855 -> 10.20.1.2:56855
+```
+
+If `destination_ports` has one port, all listen ports go to that one destination port:
+
+```text
+1|31,1030,27028|10.20.1.2|443|1
+```
+
+### Add/edit flow
 
 From the main menu choose:
 
@@ -121,36 +98,81 @@ From the main menu choose:
 1. Manage Editable Tunnels
 ```
 
-You can then:
+Then choose **Add tunnel group**.
 
-- list saved tunnels
-- add a tunnel
-- edit tunnel name, listen port, destination IP/domain, and destination port
-- enable/disable a tunnel
-- delete a tunnel
-- rebuild HAProxy config from all enabled tunnels
-- manually edit `/etc/haproxy/haproxy-tunnels.db`
-- use the old legacy quick config menu if needed
+Example input:
 
-Before applying changes, the script runs:
-
-```bash
-haproxy -c -f <temporary-config>
+```text
+Tunnel name: 1
+Listen/bind port(s) on this server: 31,1030,27028,39464,56855
+Destination IP/domain: 10.20.1.2
+Destination port(s) [empty = same as listen ports, one port = all]:
 ```
 
-If validation fails, `/etc/haproxy/haproxy.cfg` is not changed.
+Leaving destination ports empty saves the same port list automatically.
 
-### What changed in v2.3
+When editing, the script shows the selected tunnel like this:
 
-- Added editable tunnel database: `/etc/haproxy/haproxy-tunnels.db`.
-- Added tunnel manager menu.
-- Added add/edit/delete/enable/disable tunnel actions.
-- Added manual tunnel file editor from inside the script.
-- Rebuilds HAProxy config from saved enabled tunnels.
-- Prevents duplicate enabled listen ports.
-- Keeps legacy quick tunnel config available as a submenu.
-- Keeps config validation and automatic backup before replacing HAProxy config.
-- Keeps local shortcut install: `hapmenu`.
+```text
+Name:              1
+Destination IP:    10.20.1.2
+Listen ports:      31,1030,27028,39464,56855
+Destination ports: 31,1030,27028,39464,56855
+Status:            enabled
+```
+
+Then you can change only the destination IP, only the ports, or anything else. Empty fields keep the current value. For destination ports, type `same` to make them match the listen ports.
+
+### Applying to HAProxy
+
+After add/edit/delete/enable/disable, the script asks whether to apply the change to:
+
+```bash
+/etc/haproxy/haproxy.cfg
+```
+
+If you answer yes, it:
+
+1. validates the saved tunnel groups,
+2. builds a temporary HAProxy config,
+3. runs `haproxy -c -f <temporary-config>`,
+4. backs up the old config,
+5. writes `/etc/haproxy/haproxy.cfg`,
+6. restarts HAProxy.
+
+If validation fails, the main HAProxy config is not changed.
+
+### Local paths
+
+Installed script:
+
+```bash
+/opt/haproxy-menu/haproxy.sh
+```
+
+Shortcuts:
+
+```bash
+/usr/local/bin/hapmenu
+/usr/local/bin/haproxy-menu
+```
+
+Backups:
+
+```bash
+/etc/haproxy/backups
+```
+
+### What changed in v2.6
+
+- A multi-port tunnel is now saved as one grouped tunnel, not many separate records.
+- Editing one tunnel now shows its destination IP and full port list.
+- Listen ports and destination ports can be edited as comma-separated lists.
+- Add/edit/delete/enable/disable now asks to immediately write the result into `/etc/haproxy/haproxy.cfg`.
+- Applying to the main HAProxy config no longer asks twice when triggered after a change.
+- Duplicate enabled listen ports are detected across all tunnel groups.
+- Old one-port records are still valid.
+- Legacy quick config remains available from the submenu.
 
 ### Repair shortcut
 
@@ -159,7 +181,3 @@ If the shortcut is deleted or broken:
 ```bash
 sudo haproxy-menu --repair-shortcut
 ```
-
-### Menu
-
-![Menu](https://github.com/Musixal/haproxy/blob/main/menu.png)

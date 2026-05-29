@@ -5,7 +5,7 @@
 # Updated: local shortcut installer, safer config generation, validation, backups
 
 APP_NAME="haproxy-menu"
-APP_VERSION="2.4"
+APP_VERSION="2.6"
 INSTALL_DIR="/opt/haproxy-menu"
 INSTALL_FILE="$INSTALL_DIR/haproxy.sh"
 SHORTCUT_MAIN="/usr/local/bin/haproxy-menu"
@@ -31,7 +31,7 @@ show_logo() {
  / __  / ___ |/ ____/ /  / /_/ />  </ /_/ /
 /_/ /_/_/  |_/_/   /_/   \____/_/|_|\__, /
                                    /____/
-              HAProxy Menu v2.4 - bulk editable tunnels
+              HAProxy Menu v2.6 - grouped editable tunnels
 LOGO
     echo -e "${NC}"
 }
@@ -495,9 +495,14 @@ ensure_tunnels_file() {
         cat > "$TUNNELS_FILE" <<'EOF'
 # Editable HAProxy tunnels database
 # Format:
-# name|bind_port|destination_host|destination_port|enabled
-# Example:
-# iran-443|443|1.2.3.4|443|1
+# name|listen_ports|destination_host|destination_ports|enabled
+#
+# listen_ports and destination_ports can be comma-separated lists.
+# If destination_ports has one port, all listen ports go to that one destination port.
+# If destination_ports has several ports, it must have the same count as listen_ports.
+#
+# Example one grouped tunnel:
+# 1|31,1030,27028,39464,56855|10.20.1.2|31,1030,27028,39464,56855|1
 EOF
         chmod 600 "$TUNNELS_FILE"
     fi
@@ -508,10 +513,27 @@ valid_tunnel_name() {
     [ -n "$name" ] && [[ "$name" != *"|"* ]]
 }
 
+destination_ports_match_listen_ports() {
+    local listen_ports="$1"
+    local destination_ports="$2"
+    local listen_count destination_count
+
+    listen_ports="$(normalize_port_list "$listen_ports")"
+    destination_ports="$(normalize_port_list "$destination_ports")"
+
+    is_valid_port_list "$listen_ports" || return 1
+    is_valid_port_list "$destination_ports" || return 1
+
+    listen_count="$(port_list_count "$listen_ports")"
+    destination_count="$(port_list_count "$destination_ports")"
+
+    [ "$destination_count" -eq 1 ] || [ "$destination_count" -eq "$listen_count" ]
+}
+
 tunnel_bind_port_exists() {
     local wanted_port="$1"
     local exclude_index="${2:-0}"
-    local line name bind_port destination_host destination_port enabled normalized index
+    local line name listen_ports destination_host destination_ports enabled normalized index port
 
     ensure_tunnels_file
     index=0
@@ -519,20 +541,43 @@ tunnel_bind_port_exists() {
         [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
         index="$((index + 1))"
         [ "$index" = "$exclude_index" ] && continue
-        IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
-        bind_port="$(printf '%s' "$bind_port" | trim)"
+        IFS='|' read -r name listen_ports destination_host destination_ports enabled _extra <<< "$line"
+        listen_ports="$(normalize_port_list "$listen_ports")"
         enabled="$(printf '%s' "$enabled" | trim)"
         normalized="$(normalize_enabled "$enabled")"
-        if [ "$normalized" = "1" ] && [ "$bind_port" = "$wanted_port" ]; then
-            return 0
-        fi
+        [ "$normalized" = "1" ] || continue
+
+        IFS=',' read -r -a __listen_array <<< "$listen_ports"
+        for port in "${__listen_array[@]}"; do
+            if [ "$port" = "$wanted_port" ]; then
+                return 0
+            fi
+        done
     done < "$TUNNELS_FILE"
 
     return 1
 }
 
+find_conflicting_bind_port() {
+    local listen_ports="$1"
+    local exclude_index="${2:-0}"
+    local port
+
+    listen_ports="$(normalize_port_list "$listen_ports")"
+    IFS=',' read -r -a __listen_array <<< "$listen_ports"
+    for port in "${__listen_array[@]}"; do
+        if tunnel_bind_port_exists "$port" "$exclude_index"; then
+            printf '%s\n' "$port"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 check_tunnels_file() {
-    local line name bind_port destination_host destination_port enabled extra normalized index enabled_ports duplicate_found
+    local line name listen_ports destination_host destination_ports enabled extra normalized index enabled_ports duplicate_found
+    local listen_count destination_count port
 
     ensure_tunnels_file
     index=0
@@ -542,12 +587,12 @@ check_tunnels_file() {
     while IFS= read -r line || [ -n "$line" ]; do
         [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
         index="$((index + 1))"
-        IFS='|' read -r name bind_port destination_host destination_port enabled extra <<< "$line"
+        IFS='|' read -r name listen_ports destination_host destination_ports enabled extra <<< "$line"
 
         name="$(printf '%s' "$name" | trim)"
-        bind_port="$(printf '%s' "$bind_port" | trim)"
+        listen_ports="$(normalize_port_list "$listen_ports")"
         destination_host="$(printf '%s' "$destination_host" | trim)"
-        destination_port="$(printf '%s' "$destination_port" | trim)"
+        destination_ports="$(normalize_port_list "$destination_ports")"
         enabled="$(printf '%s' "$enabled" | trim)"
         normalized="$(normalize_enabled "$enabled")"
 
@@ -559,16 +604,26 @@ check_tunnels_file() {
             print_err "Tunnel #$index is invalid: name is empty or contains |"
             return 1
         fi
-        if ! is_valid_port "$bind_port"; then
-            print_err "Tunnel #$index is invalid: bind port '$bind_port'"
+        if ! is_valid_port_list "$listen_ports"; then
+            print_err "Tunnel #$index is invalid: listen port list '$listen_ports'"
+            return 1
+        fi
+        if port_list_has_duplicates "$listen_ports"; then
+            print_err "Tunnel #$index is invalid: duplicate listen ports inside the same tunnel"
             return 1
         fi
         if ! is_valid_host "$destination_host"; then
             print_err "Tunnel #$index is invalid: destination host '$destination_host'"
             return 1
         fi
-        if ! is_valid_port "$destination_port"; then
-            print_err "Tunnel #$index is invalid: destination port '$destination_port'"
+        if ! is_valid_port_list "$destination_ports"; then
+            print_err "Tunnel #$index is invalid: destination port list '$destination_ports'"
+            return 1
+        fi
+        if ! destination_ports_match_listen_ports "$listen_ports" "$destination_ports"; then
+            listen_count="$(port_list_count "$listen_ports")"
+            destination_count="$(port_list_count "$destination_ports")"
+            print_err "Tunnel #$index is invalid: destination ports count ($destination_count) must be 1 or match listen ports count ($listen_count)"
             return 1
         fi
         if [ -z "$normalized" ]; then
@@ -577,13 +632,16 @@ check_tunnels_file() {
         fi
 
         if [ "$normalized" = "1" ]; then
-            case "$enabled_ports" in
-                *" $bind_port "*)
-                    print_err "Duplicate enabled bind port found: $bind_port"
-                    duplicate_found=1
-                    ;;
-                *) enabled_ports="${enabled_ports}${bind_port} " ;;
-            esac
+            IFS=',' read -r -a __listen_array <<< "$listen_ports"
+            for port in "${__listen_array[@]}"; do
+                case "$enabled_ports" in
+                    *" $port "*)
+                        print_err "Duplicate enabled bind port found: $port"
+                        duplicate_found=1
+                        ;;
+                    *) enabled_ports="${enabled_ports}${port} " ;;
+                esac
+            done
         fi
     done < "$TUNNELS_FILE"
 
@@ -591,34 +649,46 @@ check_tunnels_file() {
     return 0
 }
 
+short_value() {
+    local value="$1"
+    local max="${2:-34}"
+    if [ "${#value}" -gt "$max" ]; then
+        printf '%s...\n' "${value:0:$((max - 3))}"
+    else
+        printf '%s\n' "$value"
+    fi
+}
+
 list_managed_tunnels() {
-    local line name bind_port destination_host destination_port enabled normalized index any status
+    local line name listen_ports destination_host destination_ports enabled normalized index any status listen_short dest_short
 
     ensure_tunnels_file
     index=0
     any=0
 
     echo
-    echo -e "${BLUE}Editable tunnels:${NC}"
-    printf '%-4s %-22s %-10s %-30s %-10s %-8s\n' "ID" "Name" "Listen" "Destination" "D.Port" "Status"
-    printf '%-4s %-22s %-10s %-30s %-10s %-8s\n' "----" "----------------------" "----------" "------------------------------" "----------" "--------"
+    echo -e "${BLUE}Editable tunnel groups:${NC}"
+    printf '%-4s %-20s %-34s %-24s %-34s %-8s\n' "ID" "Name" "Listen ports" "Destination" "Destination ports" "Status"
+    printf '%-4s %-20s %-34s %-24s %-34s %-8s\n' "----" "--------------------" "----------------------------------" "------------------------" "----------------------------------" "--------"
 
     while IFS= read -r line || [ -n "$line" ]; do
         [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
         index="$((index + 1))"
         any=1
-        IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
+        IFS='|' read -r name listen_ports destination_host destination_ports enabled _extra <<< "$line"
         name="$(printf '%s' "$name" | trim)"
-        bind_port="$(printf '%s' "$bind_port" | trim)"
+        listen_ports="$(normalize_port_list "$listen_ports")"
         destination_host="$(printf '%s' "$destination_host" | trim)"
-        destination_port="$(printf '%s' "$destination_port" | trim)"
+        destination_ports="$(normalize_port_list "$destination_ports")"
         normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
         [ "$normalized" = "1" ] && status="enabled" || status="disabled"
-        printf '%-4s %-22s %-10s %-30s %-10s %-8s\n' "$index" "${name:0:22}" "$bind_port" "${destination_host:0:30}" "$destination_port" "$status"
+        listen_short="$(short_value "$listen_ports" 34)"
+        dest_short="$(short_value "$destination_ports" 34)"
+        printf '%-4s %-20s %-34s %-24s %-34s %-8s\n' "$index" "$(short_value "$name" 20)" "$listen_short" "$(short_value "$destination_host" 24)" "$dest_short" "$status"
     done < "$TUNNELS_FILE"
 
     if [ "$any" = "0" ]; then
-        print_warn "No tunnels saved yet. Add one from the menu."
+        print_warn "No tunnel groups saved yet. Add one from the menu."
     fi
     echo
     echo "Editable file: $TUNNELS_FILE"
@@ -704,28 +774,48 @@ get_tunnel_line_by_index() {
     return 1
 }
 
+show_tunnel_details() {
+    local title="$1"
+    local name="$2"
+    local listen_ports="$3"
+    local destination_host="$4"
+    local destination_ports="$5"
+    local enabled="$6"
+    local status
+
+    [ "$(normalize_enabled "$enabled")" = "1" ] && status="enabled" || status="disabled"
+    echo
+    echo -e "${BLUE}${title}${NC}"
+    echo "Name:              $name"
+    echo "Destination IP:    $destination_host"
+    echo "Listen ports:      $listen_ports"
+    echo "Destination ports: $destination_ports"
+    echo "Status:            $status"
+    echo
+}
+
 ask_apply_managed_tunnels() {
     echo
-    if confirm_yes "Apply/rebuild HAProxy config from saved tunnels now?"; then
-        apply_managed_tunnels
+    if confirm_yes "Apply this change to $HAPROXY_CONFIG_FILE and restart HAProxy now?"; then
+        apply_managed_tunnels no-confirm
+    else
+        print_warn "Saved in $TUNNELS_FILE only. Main HAProxy config was not changed yet."
+        sleep 1
     fi
 }
 
 add_managed_tunnel() {
-    local name bind_ports destination_host destination_ports enabled
-    local bind_ports_array destination_ports_array
-    local i bind_port destination_port row_name conflict_count save_conflicts_disabled input_count destination_count
-    local added_count disabled_count
+    local name listen_ports destination_host destination_ports enabled conflict_port
 
     ensure_tunnels_file
     clear
-    echo -e "${BLUE}Add editable tunnel / port group${NC}"
-    echo "You can enter one port or many ports separated by commas."
-    echo "Example listen ports: 31,1030,27028,39464,56855"
+    echo -e "${BLUE}Add editable tunnel group${NC}"
+    echo "This creates ONE editable tunnel with one name and a list of ports."
+    echo "Example: name=1, ports=31,1030,27028,39464,56855, destination=10.20.1.2"
     echo
 
     while true; do
-        read -r -p "Tunnel/group name: " name
+        read -r -p "Tunnel name: " name
         name="$(printf '%s' "$name" | trim)"
         if [ -n "$name" ] && valid_tunnel_name "$name"; then
             break
@@ -733,27 +823,15 @@ add_managed_tunnel() {
         print_err "Invalid name. Enter a name and do not use | in it."
     done
 
-    bind_ports="$(read_port_list "Listen/bind port(s) on this server: ")"
+    listen_ports="$(read_port_list "Listen/bind port(s) on this server: ")"
     destination_host="$(read_host "Destination IP/domain: ")"
-    destination_ports="$(read_destination_port_list "Destination port(s) [empty = same as listen ports, one port = all]: " "$bind_ports")"
+    destination_ports="$(read_destination_port_list "Destination port(s) [empty = same as listen ports, one port = all]: " "$listen_ports")"
 
-    IFS=',' read -r -a bind_ports_array <<< "$bind_ports"
-    IFS=',' read -r -a destination_ports_array <<< "$destination_ports"
-    input_count="${#bind_ports_array[@]}"
-    destination_count="${#destination_ports_array[@]}"
-
-    conflict_count=0
-    for bind_port in "${bind_ports_array[@]}"; do
-        if tunnel_bind_port_exists "$bind_port"; then
-            conflict_count="$((conflict_count + 1))"
-        fi
-    done
-
-    save_conflicts_disabled="0"
-    if [ "$conflict_count" -gt 0 ]; then
-        print_warn "$conflict_count listen port(s) are already used by enabled tunnels."
-        if confirm_yes "Save conflicting ports as disabled and save the rest enabled?"; then
-            save_conflicts_disabled="1"
+    enabled="1"
+    if conflict_port="$(find_conflicting_bind_port "$listen_ports")"; then
+        print_warn "Listen port $conflict_port is already used by another enabled tunnel."
+        if confirm_yes "Save this whole tunnel as disabled?"; then
+            enabled="0"
         else
             print_warn "Cancelled. Nothing was saved."
             sleep 1
@@ -761,44 +839,17 @@ add_managed_tunnel() {
         fi
     fi
 
-    added_count=0
-    disabled_count=0
-    for i in "${!bind_ports_array[@]}"; do
-        bind_port="$(printf '%s' "${bind_ports_array[$i]}" | trim)"
+    printf '%s|%s|%s|%s|%s\n' "$name" "$listen_ports" "$destination_host" "$destination_ports" "$enabled" >> "$TUNNELS_FILE"
 
-        if [ "$destination_count" -eq 1 ]; then
-            destination_port="$(printf '%s' "${destination_ports_array[0]}" | trim)"
-        else
-            destination_port="$(printf '%s' "${destination_ports_array[$i]}" | trim)"
-        fi
-
-        row_name="$name"
-        if [ "$input_count" -gt 1 ]; then
-            row_name="${name}-${bind_port}"
-        fi
-
-        enabled="1"
-        if [ "$save_conflicts_disabled" = "1" ] && tunnel_bind_port_exists "$bind_port"; then
-            enabled="0"
-            disabled_count="$((disabled_count + 1))"
-        fi
-
-        printf '%s|%s|%s|%s|%s\n' "$row_name" "$bind_port" "$destination_host" "$destination_port" "$enabled" >> "$TUNNELS_FILE"
-        added_count="$((added_count + 1))"
-    done
-
-    print_ok "$added_count tunnel record(s) saved."
-    if [ "$disabled_count" -gt 0 ]; then
-        print_warn "$disabled_count duplicate record(s) were saved as disabled."
-    fi
-    echo
-    list_managed_tunnels
+    print_ok "Tunnel group saved."
+    show_tunnel_details "Saved tunnel" "$name" "$listen_ports" "$destination_host" "$destination_ports" "$enabled"
     ask_apply_managed_tunnels
 }
 
 edit_managed_tunnel() {
-    local index line name bind_port destination_host destination_port enabled extra normalized
-    local new_name new_bind_port new_destination_host new_destination_port new_enabled answer
+    local index line name listen_ports destination_host destination_ports enabled extra normalized
+    local new_name new_listen_ports new_destination_host new_destination_ports new_enabled
+    local input answer conflict_port
 
     ensure_tunnels_file
     clear
@@ -806,107 +857,147 @@ edit_managed_tunnel() {
     index="$(read_tunnel_index "Enter tunnel ID to edit: ")" || { pause; return 1; }
     line="$(get_tunnel_line_by_index "$index")" || { print_err "Tunnel not found."; pause; return 1; }
 
-    IFS='|' read -r name bind_port destination_host destination_port enabled extra <<< "$line"
+    IFS='|' read -r name listen_ports destination_host destination_ports enabled extra <<< "$line"
     name="$(printf '%s' "$name" | trim)"
-    bind_port="$(printf '%s' "$bind_port" | trim)"
+    listen_ports="$(normalize_port_list "$listen_ports")"
     destination_host="$(printf '%s' "$destination_host" | trim)"
-    destination_port="$(printf '%s' "$destination_port" | trim)"
+    destination_ports="$(normalize_port_list "$destination_ports")"
     normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
     [ "$normalized" = "1" ] || normalized="0"
 
-    echo
+    show_tunnel_details "Selected tunnel" "$name" "$listen_ports" "$destination_host" "$destination_ports" "$normalized"
     echo "Leave a field empty to keep the current value."
-    read -r -p "Name [$name]: " new_name
-    read -r -p "Listen/bind port [$bind_port]: " new_bind_port
-    read -r -p "Destination IP/domain [$destination_host]: " new_destination_host
-    read -r -p "Destination port [$destination_port]: " new_destination_port
+    echo "For destination ports, type 'same' to make them the same as listen ports."
+    echo
+
+    read -r -p "Name [$name]: " input
+    new_name="$(printf '%s' "${input:-$name}" | trim)"
+
+    read -r -p "Listen/bind port(s) [$listen_ports]: " input
+    input="$(normalize_port_list "$input")"
+    if [ -z "$input" ]; then
+        new_listen_ports="$listen_ports"
+    elif is_valid_port_list "$input" && ! port_list_has_duplicates "$input"; then
+        new_listen_ports="$input"
+    else
+        print_err "Invalid listen port list. Nothing was changed."
+        pause
+        return 1
+    fi
+
+    read -r -p "Destination IP/domain [$destination_host]: " input
+    input="$(printf '%s' "$input" | trim)"
+    new_destination_host="${input:-$destination_host}"
+
+    read -r -p "Destination port(s) [$destination_ports]: " input
+    input="$(printf '%s' "$input" | trim)"
+    if [ -z "$input" ]; then
+        new_destination_ports="$destination_ports"
+        if ! destination_ports_match_listen_ports "$new_listen_ports" "$new_destination_ports"; then
+            new_destination_ports="$new_listen_ports"
+            print_warn "Destination port list did not match the new listen-port count, so it was reset to the same ports."
+        fi
+    elif [ "$input" = "same" ] || [ "$input" = "SAME" ]; then
+        new_destination_ports="$new_listen_ports"
+    else
+        input="$(normalize_port_list "$input")"
+        if destination_ports_match_listen_ports "$new_listen_ports" "$input"; then
+            new_destination_ports="$input"
+        else
+            print_err "Invalid destination ports. Use one port, a matching comma list, or type same. Nothing was changed."
+            pause
+            return 1
+        fi
+    fi
+
     read -r -p "Enabled? yes/no [$normalized]: " answer
-
-    new_name="$(printf '%s' "${new_name:-$name}" | trim)"
-    new_bind_port="$(printf '%s' "${new_bind_port:-$bind_port}" | trim)"
-    new_destination_host="$(printf '%s' "${new_destination_host:-$destination_host}" | trim)"
-    new_destination_port="$(printf '%s' "${new_destination_port:-$destination_port}" | trim)"
-
     if [ -z "$answer" ]; then
         new_enabled="$normalized"
     else
         new_enabled="$(normalize_enabled "$(printf '%s' "$answer" | trim)")"
     fi
 
-    if ! valid_tunnel_name "$new_name" || ! is_valid_port "$new_bind_port" || ! is_valid_host "$new_destination_host" || ! is_valid_port "$new_destination_port" || [ -z "$new_enabled" ]; then
+    if ! valid_tunnel_name "$new_name" || ! is_valid_host "$new_destination_host" || [ -z "$new_enabled" ]; then
         print_err "Invalid input. Nothing was changed."
         pause
         return 1
     fi
 
-    if [ "$new_enabled" = "1" ] && tunnel_bind_port_exists "$new_bind_port" "$index"; then
-        print_err "Another enabled tunnel already uses bind port $new_bind_port. Disable that one first or choose another port."
+    if [ "$new_enabled" = "1" ] && conflict_port="$(find_conflicting_bind_port "$new_listen_ports" "$index")"; then
+        print_err "Another enabled tunnel already uses listen port $conflict_port. Disable that one first or choose another port."
         pause
         return 1
     fi
 
-    replace_tunnel_line "$index" "${new_name}|${new_bind_port}|${new_destination_host}|${new_destination_port}|${new_enabled}"
-    print_ok "Tunnel updated."
+    replace_tunnel_line "$index" "${new_name}|${new_listen_ports}|${new_destination_host}|${new_destination_ports}|${new_enabled}"
+    print_ok "Tunnel group updated."
+    show_tunnel_details "Updated tunnel" "$new_name" "$new_listen_ports" "$new_destination_host" "$new_destination_ports" "$new_enabled"
     ask_apply_managed_tunnels
 }
 
 toggle_managed_tunnel() {
-    local index line name bind_port destination_host destination_port enabled normalized new_enabled
+    local index line name listen_ports destination_host destination_ports enabled normalized new_enabled conflict_port
 
     ensure_tunnels_file
     clear
     list_managed_tunnels
     index="$(read_tunnel_index "Enter tunnel ID to enable/disable: ")" || { pause; return 1; }
     line="$(get_tunnel_line_by_index "$index")" || { print_err "Tunnel not found."; pause; return 1; }
-    IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
+    IFS='|' read -r name listen_ports destination_host destination_ports enabled _extra <<< "$line"
 
     name="$(printf '%s' "$name" | trim)"
-    bind_port="$(printf '%s' "$bind_port" | trim)"
+    listen_ports="$(normalize_port_list "$listen_ports")"
     destination_host="$(printf '%s' "$destination_host" | trim)"
-    destination_port="$(printf '%s' "$destination_port" | trim)"
+    destination_ports="$(normalize_port_list "$destination_ports")"
     normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
 
     if [ "$normalized" = "1" ]; then
         new_enabled="0"
     else
-        if tunnel_bind_port_exists "$bind_port" "$index"; then
-            print_err "Cannot enable. Another enabled tunnel already uses bind port $bind_port."
+        if conflict_port="$(find_conflicting_bind_port "$listen_ports" "$index")"; then
+            print_err "Cannot enable. Another enabled tunnel already uses listen port $conflict_port."
             pause
             return 1
         fi
         new_enabled="1"
     fi
 
-    replace_tunnel_line "$index" "${name}|${bind_port}|${destination_host}|${destination_port}|${new_enabled}"
-    [ "$new_enabled" = "1" ] && print_ok "Tunnel enabled." || print_warn "Tunnel disabled."
+    replace_tunnel_line "$index" "${name}|${listen_ports}|${destination_host}|${destination_ports}|${new_enabled}"
+    [ "$new_enabled" = "1" ] && print_ok "Tunnel group enabled." || print_warn "Tunnel group disabled."
+    show_tunnel_details "Tunnel" "$name" "$listen_ports" "$destination_host" "$destination_ports" "$new_enabled"
     ask_apply_managed_tunnels
 }
 
 delete_managed_tunnel() {
-    local index
+    local index line name listen_ports destination_host destination_ports enabled _extra
 
     ensure_tunnels_file
     clear
     list_managed_tunnels
     index="$(read_tunnel_index "Enter tunnel ID to delete: ")" || { pause; return 1; }
+    line="$(get_tunnel_line_by_index "$index")" || { print_err "Tunnel not found."; pause; return 1; }
+    IFS='|' read -r name listen_ports destination_host destination_ports enabled _extra <<< "$line"
+    show_tunnel_details "Selected tunnel" "$name" "$(normalize_port_list "$listen_ports")" "$destination_host" "$(normalize_port_list "$destination_ports")" "$enabled"
 
-    if ! confirm_yes "Delete tunnel #$index from saved tunnels?"; then
+    if ! confirm_yes "Delete this tunnel group from saved tunnels?"; then
         print_warn "Cancelled."
         sleep 1
         return 0
     fi
 
     delete_tunnel_line "$index"
-    print_ok "Tunnel deleted."
+    print_ok "Tunnel group deleted."
     ask_apply_managed_tunnels
 }
 
 apply_managed_tunnels() {
-    local tmp_file line name bind_port destination_host destination_port enabled normalized index enabled_count safe_name
+    local mode="${1:-confirm}"
+    local tmp_file line name listen_ports destination_host destination_ports enabled normalized index enabled_count safe_name
+    local listen_count destination_count i bind_port destination_port
 
     ensure_tunnels_file
     echo
-    print_warn "Checking saved tunnels..."
+    print_warn "Checking saved tunnel groups..."
     if ! check_tunnels_file; then
         print_err "Saved tunnels are invalid. HAProxy config was not changed."
         pause
@@ -921,20 +1012,34 @@ apply_managed_tunnels() {
     while IFS= read -r line || [ -n "$line" ]; do
         [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
         index="$((index + 1))"
-        IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
+        IFS='|' read -r name listen_ports destination_host destination_ports enabled _extra <<< "$line"
         name="$(printf '%s' "$name" | trim)"
-        bind_port="$(printf '%s' "$bind_port" | trim)"
+        listen_ports="$(normalize_port_list "$listen_ports")"
         destination_host="$(printf '%s' "$destination_host" | trim)"
-        destination_port="$(printf '%s' "$destination_port" | trim)"
+        destination_ports="$(normalize_port_list "$destination_ports")"
         normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
         [ "$normalized" = "1" ] || continue
-        enabled_count="$((enabled_count + 1))"
-        safe_name="$(sanitize_id "${index}_${name}")"
-        append_single_tunnel "$tmp_file" "$bind_port" "$destination_host" "$destination_port" "$safe_name"
+
+        IFS=',' read -r -a __listen_array <<< "$listen_ports"
+        IFS=',' read -r -a __destination_array <<< "$destination_ports"
+        listen_count="${#__listen_array[@]}"
+        destination_count="${#__destination_array[@]}"
+
+        for i in "${!__listen_array[@]}"; do
+            bind_port="$(printf '%s' "${__listen_array[$i]}" | trim)"
+            if [ "$destination_count" -eq 1 ]; then
+                destination_port="$(printf '%s' "${__destination_array[0]}" | trim)"
+            else
+                destination_port="$(printf '%s' "${__destination_array[$i]}" | trim)"
+            fi
+            enabled_count="$((enabled_count + 1))"
+            safe_name="$(sanitize_id "${index}_${name}_${bind_port}")"
+            append_single_tunnel "$tmp_file" "$bind_port" "$destination_host" "$destination_port" "$safe_name"
+        done
     done < "$TUNNELS_FILE"
 
     if [ "$enabled_count" -eq 0 ]; then
-        print_warn "There are no enabled tunnels. This will write a base HAProxy config with no listening ports."
+        print_warn "There are no enabled listen ports. This will write a base HAProxy config with no listening ports."
         if ! confirm_yes "Continue?"; then
             rm -f "$tmp_file"
             print_warn "Cancelled."
@@ -943,12 +1048,14 @@ apply_managed_tunnels() {
         fi
     fi
 
-    print_warn "This will rebuild $HAPROXY_CONFIG_FILE from the saved tunnel list. A backup will be created first."
-    if ! confirm_yes "Continue?"; then
-        rm -f "$tmp_file"
-        print_warn "Cancelled."
-        sleep 1
-        return 0
+    if [ "$mode" != "no-confirm" ]; then
+        print_warn "This will rebuild $HAPROXY_CONFIG_FILE from the saved tunnel groups. A backup will be created first."
+        if ! confirm_yes "Continue?"; then
+            rm -f "$tmp_file"
+            print_warn "Cancelled."
+            sleep 1
+            return 0
+        fi
     fi
 
     apply_config "$tmp_file"
@@ -962,8 +1069,8 @@ edit_tunnels_file_manually() {
     echo -e "${BLUE}Manual editable tunnel file${NC}"
     echo
     echo "File: $TUNNELS_FILE"
-    echo "Format: name|bind_port|destination_host|destination_port|enabled"
-    echo "Example: iran-443|443|1.2.3.4|443|1"
+    echo "Format: name|listen_ports|destination_host|destination_ports|enabled"
+    echo "Example: 1|31,1030,27028,39464,56855|10.20.1.2|31,1030,27028,39464,56855|1"
     echo
 
     editor="${EDITOR:-}"
@@ -1002,14 +1109,14 @@ tunnel_manager_menu() {
         echo -e "${BLUE}Editable Tunnel Manager${NC}"
         echo "-------------------------------"
         echo "Saved tunnel file: $TUNNELS_FILE"
-        echo "Each tunnel: name | listen port | destination IP/domain | destination port | enabled"
+        echo "Each tunnel group: name | listen ports | destination IP/domain | destination ports | enabled"
         echo "-------------------------------"
-        echo -e "${GREEN}1. List saved tunnels${NC}"
-        echo -e "${GREEN}2. Add tunnel / port group${NC}"
-        echo -e "${YELLOW}3. Edit tunnel${NC}"
-        echo -e "${YELLOW}4. Enable/disable tunnel${NC}"
-        echo -e "${RED}5. Delete tunnel${NC}"
-        echo -e "${BLUE}6. Apply/rebuild HAProxy config from saved tunnels${NC}"
+        echo -e "${GREEN}1. List saved tunnel groups${NC}"
+        echo -e "${GREEN}2. Add tunnel group${NC}"
+        echo -e "${YELLOW}3. Edit tunnel group${NC}"
+        echo -e "${YELLOW}4. Enable/disable tunnel group${NC}"
+        echo -e "${RED}5. Delete tunnel group${NC}"
+        echo -e "${BLUE}6. Apply/rebuild HAProxy config from saved tunnel groups${NC}"
         echo "7. Edit tunnel file manually"
         echo "8. Legacy quick tunnel config"
         echo "9. Back"
