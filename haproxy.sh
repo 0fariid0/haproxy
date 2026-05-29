@@ -5,7 +5,7 @@
 # Updated: local shortcut installer, safer config generation, validation, backups
 
 APP_NAME="haproxy-menu"
-APP_VERSION="2.0"
+APP_VERSION="2.3"
 INSTALL_DIR="/opt/haproxy-menu"
 INSTALL_FILE="$INSTALL_DIR/haproxy.sh"
 SHORTCUT_MAIN="/usr/local/bin/haproxy-menu"
@@ -13,6 +13,8 @@ SHORTCUT_SHORT="/usr/local/bin/hapmenu"
 HAPROXY_CONFIG_FILE="/etc/haproxy/haproxy.cfg"
 BACKUP_DIR="/etc/haproxy/backups"
 LOG_FILE="/var/log/haproxy.log"
+TUNNELS_FILE="/etc/haproxy/haproxy-tunnels.db"
+SCRIPT_URL="https://raw.githubusercontent.com/0fariid0/haproxy/main/haproxy.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -29,7 +31,7 @@ show_logo() {
  / __  / ___ |/ ____/ /  / /_/ />  </ /_/ /
 /_/ /_/_/  |_/_/   /_/   \____/_/|_|\__, /
                                    /____/
-              HAProxy Menu v2.0 - local shortcut ready
+              HAProxy Menu v2.3 - editable tunnels
 LOGO
     echo -e "${NC}"
 }
@@ -86,14 +88,37 @@ install_packages_if_missing() {
 
 self_install() {
     local source_file="${BASH_SOURCE[0]}"
+    local source_real=""
+    local install_real=""
+    local tmp_file
+    local installed_version
 
     mkdir -p "$INSTALL_DIR"
+    tmp_file="$INSTALL_FILE.tmp.$$"
 
-    if [ -r "$source_file" ]; then
-        cp "$source_file" "$INSTALL_FILE"
-    elif [ -r "$0" ]; then
-        cp "$0" "$INSTALL_FILE"
+    source_real="$(readlink -f "$source_file" 2>/dev/null || true)"
+    install_real="$(readlink -f "$INSTALL_FILE" 2>/dev/null || true)"
+
+    if [ -r "$source_file" ] && [ "$source_real" != "$install_real" ]; then
+        cp "$source_file" "$tmp_file"
+        mv -f "$tmp_file" "$INSTALL_FILE"
+    elif [ -r "$0" ] && [ "$(readlink -f "$0" 2>/dev/null || true)" != "$install_real" ]; then
+        cp "$0" "$tmp_file"
+        mv -f "$tmp_file" "$INSTALL_FILE"
+    elif [ -f "$INSTALL_FILE" ]; then
+        # Running from the installed file. Nothing to copy; repair shortcuts only.
+        :
+    elif command_exists curl; then
+        print_warn "Could not copy the running script. Downloading a fresh copy for local install..."
+        if ! curl -4 -fsSL "$SCRIPT_URL" -o "$tmp_file"; then
+            rm -f "$tmp_file"
+            print_err "Could not download the script to $INSTALL_FILE"
+            print_warn "Download the script once, then run: sudo bash haproxy.sh --install"
+            return 1
+        fi
+        mv -f "$tmp_file" "$INSTALL_FILE"
     else
+        rm -f "$tmp_file"
         print_err "Could not copy the running script to $INSTALL_FILE"
         print_warn "Download the script once, then run: sudo bash haproxy.sh --install"
         return 1
@@ -102,8 +127,11 @@ self_install() {
     chmod 755 "$INSTALL_FILE"
     ln -sf "$INSTALL_FILE" "$SHORTCUT_MAIN"
     ln -sf "$INSTALL_FILE" "$SHORTCUT_SHORT"
+    hash -r 2>/dev/null || true
 
+    installed_version="$(grep -m1 '^APP_VERSION=' "$INSTALL_FILE" 2>/dev/null | cut -d'"' -f2)"
     print_ok "Local install completed."
+    print_ok "Installed version: ${installed_version:-unknown}"
     print_ok "Main command: sudo haproxy-menu"
     print_ok "Shortcut:     sudo hapmenu"
     print_ok "Installed at: $INSTALL_FILE"
@@ -130,18 +158,47 @@ show_help() {
 $APP_NAME v$APP_VERSION
 
 Usage:
-  sudo bash haproxy.sh --install     Install locally and create shortcuts
-  sudo hapmenu                       Open menu after installation
-  sudo haproxy-menu                  Open menu after installation
+  sudo bash haproxy.sh --install      Install locally and create shortcuts
+  sudo bash haproxy.sh --only-install Install locally without opening menu
+  sudo hapmenu                        Open menu after installation
+  sudo haproxy-menu                   Open menu after installation
   sudo haproxy-menu --repair-shortcut Recreate shortcuts
-  sudo haproxy-menu --help           Show this help
+  haproxy-menu --version              Show installed version
+  haproxy-menu --doctor               Show install path and shortcut diagnostics
+  sudo haproxy-menu --help            Show this help
 
 The script is installed at: $INSTALL_FILE
+Editable tunnels are stored at: $TUNNELS_FILE
 Shortcuts are created at:
   $SHORTCUT_MAIN
   $SHORTCUT_SHORT
 HELP
 }
+
+show_doctor() {
+    echo "$APP_NAME v$APP_VERSION"
+    echo
+    echo "Command resolution:"
+    echo "  command -v hapmenu:       $(command -v hapmenu 2>/dev/null || echo not found)"
+    echo "  command -v haproxy-menu:  $(command -v haproxy-menu 2>/dev/null || echo not found)"
+    echo
+    echo "Symlinks:"
+    echo "  $SHORTCUT_SHORT -> $(readlink -f "$SHORTCUT_SHORT" 2>/dev/null || echo missing)"
+    echo "  $SHORTCUT_MAIN -> $(readlink -f "$SHORTCUT_MAIN" 2>/dev/null || echo missing)"
+    echo
+    echo "Installed file:"
+    if [ -f "$INSTALL_FILE" ]; then
+        echo "  Path: $INSTALL_FILE"
+        echo "  Version line: $(grep -m1 '^APP_VERSION=' "$INSTALL_FILE" 2>/dev/null || echo missing)"
+        echo "  Tunnel menu: $(grep -m1 'Manage Editable Tunnels' "$INSTALL_FILE" 2>/dev/null || echo missing)"
+    else
+        echo "  Missing: $INSTALL_FILE"
+    fi
+    echo
+    echo "Running file:"
+    echo "  ${BASH_SOURCE[0]}"
+}
+
 
 trim() {
     sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
@@ -312,6 +369,517 @@ backend backend_${bind_port}_${name_suffix}
     server server_${bind_port}_${name_suffix} ${backend_addr} check
 
 CFG
+}
+
+
+sanitize_id() {
+    local value="$1"
+    value="$(printf '%s' "$value" | tr -c '[:alnum:]_' '_' | sed 's/^_*//;s/_*$//')"
+    [ -n "$value" ] || value="tunnel"
+    printf '%s\n' "$value"
+}
+
+normalize_enabled() {
+    local value="$1"
+    case "$value" in
+        1|yes|YES|Yes|y|Y|true|TRUE|on|ON|enable|enabled) echo "1" ;;
+        0|no|NO|No|n|N|false|FALSE|off|OFF|disable|disabled) echo "0" ;;
+        *) echo "" ;;
+    esac
+}
+
+ensure_tunnels_file() {
+    mkdir -p "$(dirname "$TUNNELS_FILE")"
+    if [ ! -f "$TUNNELS_FILE" ]; then
+        cat > "$TUNNELS_FILE" <<'EOF'
+# Editable HAProxy tunnels database
+# Format:
+# name|bind_port|destination_host|destination_port|enabled
+# Example:
+# iran-443|443|1.2.3.4|443|1
+EOF
+        chmod 600 "$TUNNELS_FILE"
+    fi
+}
+
+valid_tunnel_name() {
+    local name="$1"
+    [ -n "$name" ] && [[ "$name" != *"|"* ]]
+}
+
+tunnel_bind_port_exists() {
+    local wanted_port="$1"
+    local exclude_index="${2:-0}"
+    local line name bind_port destination_host destination_port enabled normalized index
+
+    ensure_tunnels_file
+    index=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
+        index="$((index + 1))"
+        [ "$index" = "$exclude_index" ] && continue
+        IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
+        bind_port="$(printf '%s' "$bind_port" | trim)"
+        enabled="$(printf '%s' "$enabled" | trim)"
+        normalized="$(normalize_enabled "$enabled")"
+        if [ "$normalized" = "1" ] && [ "$bind_port" = "$wanted_port" ]; then
+            return 0
+        fi
+    done < "$TUNNELS_FILE"
+
+    return 1
+}
+
+check_tunnels_file() {
+    local line name bind_port destination_host destination_port enabled extra normalized index enabled_ports duplicate_found
+
+    ensure_tunnels_file
+    index=0
+    enabled_ports=" "
+    duplicate_found=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
+        index="$((index + 1))"
+        IFS='|' read -r name bind_port destination_host destination_port enabled extra <<< "$line"
+
+        name="$(printf '%s' "$name" | trim)"
+        bind_port="$(printf '%s' "$bind_port" | trim)"
+        destination_host="$(printf '%s' "$destination_host" | trim)"
+        destination_port="$(printf '%s' "$destination_port" | trim)"
+        enabled="$(printf '%s' "$enabled" | trim)"
+        normalized="$(normalize_enabled "$enabled")"
+
+        if [ -n "$extra" ]; then
+            print_err "Tunnel #$index is invalid: too many fields. Do not use | inside values."
+            return 1
+        fi
+        if ! valid_tunnel_name "$name"; then
+            print_err "Tunnel #$index is invalid: name is empty or contains |"
+            return 1
+        fi
+        if ! is_valid_port "$bind_port"; then
+            print_err "Tunnel #$index is invalid: bind port '$bind_port'"
+            return 1
+        fi
+        if ! is_valid_host "$destination_host"; then
+            print_err "Tunnel #$index is invalid: destination host '$destination_host'"
+            return 1
+        fi
+        if ! is_valid_port "$destination_port"; then
+            print_err "Tunnel #$index is invalid: destination port '$destination_port'"
+            return 1
+        fi
+        if [ -z "$normalized" ]; then
+            print_err "Tunnel #$index is invalid: enabled must be 1/0, yes/no, on/off"
+            return 1
+        fi
+
+        if [ "$normalized" = "1" ]; then
+            case "$enabled_ports" in
+                *" $bind_port "*)
+                    print_err "Duplicate enabled bind port found: $bind_port"
+                    duplicate_found=1
+                    ;;
+                *) enabled_ports="${enabled_ports}${bind_port} " ;;
+            esac
+        fi
+    done < "$TUNNELS_FILE"
+
+    [ "$duplicate_found" = "0" ] || return 1
+    return 0
+}
+
+list_managed_tunnels() {
+    local line name bind_port destination_host destination_port enabled normalized index any status
+
+    ensure_tunnels_file
+    index=0
+    any=0
+
+    echo
+    echo -e "${BLUE}Editable tunnels:${NC}"
+    printf '%-4s %-22s %-10s %-30s %-10s %-8s\n' "ID" "Name" "Listen" "Destination" "D.Port" "Status"
+    printf '%-4s %-22s %-10s %-30s %-10s %-8s\n' "----" "----------------------" "----------" "------------------------------" "----------" "--------"
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
+        index="$((index + 1))"
+        any=1
+        IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
+        name="$(printf '%s' "$name" | trim)"
+        bind_port="$(printf '%s' "$bind_port" | trim)"
+        destination_host="$(printf '%s' "$destination_host" | trim)"
+        destination_port="$(printf '%s' "$destination_port" | trim)"
+        normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
+        [ "$normalized" = "1" ] && status="enabled" || status="disabled"
+        printf '%-4s %-22s %-10s %-30s %-10s %-8s\n' "$index" "${name:0:22}" "$bind_port" "${destination_host:0:30}" "$destination_port" "$status"
+    done < "$TUNNELS_FILE"
+
+    if [ "$any" = "0" ]; then
+        print_warn "No tunnels saved yet. Add one from the menu."
+    fi
+    echo
+    echo "Editable file: $TUNNELS_FILE"
+}
+
+read_tunnel_index() {
+    local prompt="$1"
+    local index total
+    total="$(grep -vcE '^[[:space:]]*($|#)' "$TUNNELS_FILE" 2>/dev/null || true)"
+    total="${total:-0}"
+
+    if [ "$total" -eq 0 ]; then
+        print_warn "No saved tunnels found."
+        return 1
+    fi
+
+    while true; do
+        read -r -p "$prompt" index
+        index="$(printf '%s' "$index" | trim)"
+        if [[ "$index" =~ ^[0-9]+$ ]] && [ "$index" -ge 1 ] && [ "$index" -le "$total" ]; then
+            printf '%s\n' "$index"
+            return 0
+        fi
+        print_err "Invalid ID. Enter a number between 1 and $total."
+    done
+}
+
+replace_tunnel_line() {
+    local target_index="$1"
+    local new_line="$2"
+    local tmp line data_index
+
+    tmp="$(mktemp)"
+    data_index=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[[:space:]]*($|#) ]]; then
+            echo "$line" >> "$tmp"
+            continue
+        fi
+        data_index="$((data_index + 1))"
+        if [ "$data_index" = "$target_index" ]; then
+            echo "$new_line" >> "$tmp"
+        else
+            echo "$line" >> "$tmp"
+        fi
+    done < "$TUNNELS_FILE"
+    install -m 600 "$tmp" "$TUNNELS_FILE"
+    rm -f "$tmp"
+}
+
+delete_tunnel_line() {
+    local target_index="$1"
+    local tmp line data_index
+
+    tmp="$(mktemp)"
+    data_index=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" =~ ^[[:space:]]*($|#) ]]; then
+            echo "$line" >> "$tmp"
+            continue
+        fi
+        data_index="$((data_index + 1))"
+        [ "$data_index" = "$target_index" ] && continue
+        echo "$line" >> "$tmp"
+    done < "$TUNNELS_FILE"
+    install -m 600 "$tmp" "$TUNNELS_FILE"
+    rm -f "$tmp"
+}
+
+get_tunnel_line_by_index() {
+    local target_index="$1"
+    local line data_index
+
+    data_index=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
+        data_index="$((data_index + 1))"
+        if [ "$data_index" = "$target_index" ]; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+    done < "$TUNNELS_FILE"
+    return 1
+}
+
+ask_apply_managed_tunnels() {
+    echo
+    if confirm_yes "Apply/rebuild HAProxy config from saved tunnels now?"; then
+        apply_managed_tunnels
+    fi
+}
+
+add_managed_tunnel() {
+    local name bind_port destination_host destination_port enabled
+
+    ensure_tunnels_file
+    clear
+    echo -e "${BLUE}Add editable tunnel${NC}"
+    echo
+
+    bind_port="$(read_port "Listen/bind port on this server: ")"
+    destination_host="$(read_host "Destination IP/domain: ")"
+    destination_port="$(read_port "Destination port: ")"
+    read -r -p "Tunnel name (optional): " name
+    name="$(printf '%s' "$name" | trim)"
+    [ -n "$name" ] || name="tunnel-${bind_port}-to-${destination_port}"
+
+    if ! valid_tunnel_name "$name"; then
+        print_err "Invalid name. Do not use | in tunnel names."
+        pause
+        return 1
+    fi
+
+    if tunnel_bind_port_exists "$bind_port"; then
+        print_warn "Another enabled tunnel already listens on port $bind_port."
+        if ! confirm_yes "Save it anyway as disabled?"; then
+            print_warn "Cancelled."
+            sleep 1
+            return 0
+        fi
+        enabled="0"
+    else
+        enabled="1"
+    fi
+
+    printf '%s|%s|%s|%s|%s\n' "$name" "$bind_port" "$destination_host" "$destination_port" "$enabled" >> "$TUNNELS_FILE"
+    print_ok "Tunnel saved."
+    ask_apply_managed_tunnels
+}
+
+edit_managed_tunnel() {
+    local index line name bind_port destination_host destination_port enabled extra normalized
+    local new_name new_bind_port new_destination_host new_destination_port new_enabled answer
+
+    ensure_tunnels_file
+    clear
+    list_managed_tunnels
+    index="$(read_tunnel_index "Enter tunnel ID to edit: ")" || { pause; return 1; }
+    line="$(get_tunnel_line_by_index "$index")" || { print_err "Tunnel not found."; pause; return 1; }
+
+    IFS='|' read -r name bind_port destination_host destination_port enabled extra <<< "$line"
+    name="$(printf '%s' "$name" | trim)"
+    bind_port="$(printf '%s' "$bind_port" | trim)"
+    destination_host="$(printf '%s' "$destination_host" | trim)"
+    destination_port="$(printf '%s' "$destination_port" | trim)"
+    normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
+    [ "$normalized" = "1" ] || normalized="0"
+
+    echo
+    echo "Leave a field empty to keep the current value."
+    read -r -p "Name [$name]: " new_name
+    read -r -p "Listen/bind port [$bind_port]: " new_bind_port
+    read -r -p "Destination IP/domain [$destination_host]: " new_destination_host
+    read -r -p "Destination port [$destination_port]: " new_destination_port
+    read -r -p "Enabled? yes/no [$normalized]: " answer
+
+    new_name="$(printf '%s' "${new_name:-$name}" | trim)"
+    new_bind_port="$(printf '%s' "${new_bind_port:-$bind_port}" | trim)"
+    new_destination_host="$(printf '%s' "${new_destination_host:-$destination_host}" | trim)"
+    new_destination_port="$(printf '%s' "${new_destination_port:-$destination_port}" | trim)"
+
+    if [ -z "$answer" ]; then
+        new_enabled="$normalized"
+    else
+        new_enabled="$(normalize_enabled "$(printf '%s' "$answer" | trim)")"
+    fi
+
+    if ! valid_tunnel_name "$new_name" || ! is_valid_port "$new_bind_port" || ! is_valid_host "$new_destination_host" || ! is_valid_port "$new_destination_port" || [ -z "$new_enabled" ]; then
+        print_err "Invalid input. Nothing was changed."
+        pause
+        return 1
+    fi
+
+    if [ "$new_enabled" = "1" ] && tunnel_bind_port_exists "$new_bind_port" "$index"; then
+        print_err "Another enabled tunnel already uses bind port $new_bind_port. Disable that one first or choose another port."
+        pause
+        return 1
+    fi
+
+    replace_tunnel_line "$index" "${new_name}|${new_bind_port}|${new_destination_host}|${new_destination_port}|${new_enabled}"
+    print_ok "Tunnel updated."
+    ask_apply_managed_tunnels
+}
+
+toggle_managed_tunnel() {
+    local index line name bind_port destination_host destination_port enabled normalized new_enabled
+
+    ensure_tunnels_file
+    clear
+    list_managed_tunnels
+    index="$(read_tunnel_index "Enter tunnel ID to enable/disable: ")" || { pause; return 1; }
+    line="$(get_tunnel_line_by_index "$index")" || { print_err "Tunnel not found."; pause; return 1; }
+    IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
+
+    name="$(printf '%s' "$name" | trim)"
+    bind_port="$(printf '%s' "$bind_port" | trim)"
+    destination_host="$(printf '%s' "$destination_host" | trim)"
+    destination_port="$(printf '%s' "$destination_port" | trim)"
+    normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
+
+    if [ "$normalized" = "1" ]; then
+        new_enabled="0"
+    else
+        if tunnel_bind_port_exists "$bind_port" "$index"; then
+            print_err "Cannot enable. Another enabled tunnel already uses bind port $bind_port."
+            pause
+            return 1
+        fi
+        new_enabled="1"
+    fi
+
+    replace_tunnel_line "$index" "${name}|${bind_port}|${destination_host}|${destination_port}|${new_enabled}"
+    [ "$new_enabled" = "1" ] && print_ok "Tunnel enabled." || print_warn "Tunnel disabled."
+    ask_apply_managed_tunnels
+}
+
+delete_managed_tunnel() {
+    local index
+
+    ensure_tunnels_file
+    clear
+    list_managed_tunnels
+    index="$(read_tunnel_index "Enter tunnel ID to delete: ")" || { pause; return 1; }
+
+    if ! confirm_yes "Delete tunnel #$index from saved tunnels?"; then
+        print_warn "Cancelled."
+        sleep 1
+        return 0
+    fi
+
+    delete_tunnel_line "$index"
+    print_ok "Tunnel deleted."
+    ask_apply_managed_tunnels
+}
+
+apply_managed_tunnels() {
+    local tmp_file line name bind_port destination_host destination_port enabled normalized index enabled_count safe_name
+
+    ensure_tunnels_file
+    echo
+    print_warn "Checking saved tunnels..."
+    if ! check_tunnels_file; then
+        print_err "Saved tunnels are invalid. HAProxy config was not changed."
+        pause
+        return 1
+    fi
+
+    tmp_file="$(mktemp)"
+    write_base_config "$tmp_file"
+    index=0
+    enabled_count=0
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        [[ "$line" =~ ^[[:space:]]*($|#) ]] && continue
+        index="$((index + 1))"
+        IFS='|' read -r name bind_port destination_host destination_port enabled _extra <<< "$line"
+        name="$(printf '%s' "$name" | trim)"
+        bind_port="$(printf '%s' "$bind_port" | trim)"
+        destination_host="$(printf '%s' "$destination_host" | trim)"
+        destination_port="$(printf '%s' "$destination_port" | trim)"
+        normalized="$(normalize_enabled "$(printf '%s' "$enabled" | trim)")"
+        [ "$normalized" = "1" ] || continue
+        enabled_count="$((enabled_count + 1))"
+        safe_name="$(sanitize_id "${index}_${name}")"
+        append_single_tunnel "$tmp_file" "$bind_port" "$destination_host" "$destination_port" "$safe_name"
+    done < "$TUNNELS_FILE"
+
+    if [ "$enabled_count" -eq 0 ]; then
+        print_warn "There are no enabled tunnels. This will write a base HAProxy config with no listening ports."
+        if ! confirm_yes "Continue?"; then
+            rm -f "$tmp_file"
+            print_warn "Cancelled."
+            sleep 1
+            return 0
+        fi
+    fi
+
+    print_warn "This will rebuild $HAPROXY_CONFIG_FILE from the saved tunnel list. A backup will be created first."
+    if ! confirm_yes "Continue?"; then
+        rm -f "$tmp_file"
+        print_warn "Cancelled."
+        sleep 1
+        return 0
+    fi
+
+    apply_config "$tmp_file"
+}
+
+edit_tunnels_file_manually() {
+    local editor
+
+    ensure_tunnels_file
+    clear
+    echo -e "${BLUE}Manual editable tunnel file${NC}"
+    echo
+    echo "File: $TUNNELS_FILE"
+    echo "Format: name|bind_port|destination_host|destination_port|enabled"
+    echo "Example: iran-443|443|1.2.3.4|443|1"
+    echo
+
+    editor="${EDITOR:-}"
+    if [ -z "$editor" ]; then
+        if command_exists nano; then
+            editor="nano"
+        elif command_exists vim; then
+            editor="vim"
+        elif command_exists vi; then
+            editor="vi"
+        fi
+    fi
+
+    if [ -z "$editor" ]; then
+        print_warn "No editor found. Install nano or edit this file manually: $TUNNELS_FILE"
+        pause
+        return 1
+    fi
+
+    $editor "$TUNNELS_FILE"
+
+    echo
+    if check_tunnels_file; then
+        print_ok "Tunnel file looks valid."
+        ask_apply_managed_tunnels
+    else
+        print_err "Tunnel file has errors. HAProxy config was not changed."
+        pause
+    fi
+}
+
+tunnel_manager_menu() {
+    local choice
+    while true; do
+        clear
+        echo -e "${BLUE}Editable Tunnel Manager${NC}"
+        echo "-------------------------------"
+        echo "Saved tunnel file: $TUNNELS_FILE"
+        echo "Each tunnel: name | listen port | destination IP/domain | destination port | enabled"
+        echo "-------------------------------"
+        echo -e "${GREEN}1. List saved tunnels${NC}"
+        echo -e "${GREEN}2. Add tunnel${NC}"
+        echo -e "${YELLOW}3. Edit tunnel${NC}"
+        echo -e "${YELLOW}4. Enable/disable tunnel${NC}"
+        echo -e "${RED}5. Delete tunnel${NC}"
+        echo -e "${BLUE}6. Apply/rebuild HAProxy config from saved tunnels${NC}"
+        echo "7. Edit tunnel file manually"
+        echo "8. Legacy quick tunnel config"
+        echo "9. Back"
+        echo "-------------------------------"
+        read -r -p "Enter your choice: " choice
+        case "$choice" in
+            1) clear; list_managed_tunnels; pause ;;
+            2) add_managed_tunnel ;;
+            3) edit_managed_tunnel ;;
+            4) toggle_managed_tunnel ;;
+            5) delete_managed_tunnel ;;
+            6) apply_managed_tunnels ;;
+            7) edit_tunnels_file_manually ;;
+            8) multiple_server_menu ;;
+            9) return 0 ;;
+            *) print_err "Invalid option!" && sleep 1 ;;
+        esac
+    done
 }
 
 configure_new_tunnel() {
@@ -601,7 +1169,7 @@ display_menu() {
     show_haproxy_status
     echo "-------------------------------"
     echo "Menu:"
-    echo -e "${GREEN}1. Configure Tunnel (IPv4/IPv6/domain)${NC}"
+    echo -e "${GREEN}1. Manage Editable Tunnels (IPv4/IPv6/domain)${NC}"
     echo -e "${BLUE}2. Configure Load Balancer (TCP)${NC}"
     echo -e "${RED}3. Stop HAProxy service and remove configs${NC}"
     echo -e "${YELLOW}4. Restart HAProxy Service${NC}"
@@ -618,7 +1186,7 @@ read_option() {
     local choice
     read -r -p "Enter your choice: " choice
     case "$choice" in
-        1) multiple_server_menu ;;
+        1) tunnel_manager_menu ;;
         2) load_balancing ;;
         3) destroy_tunnel ;;
         4) reset_service ;;
@@ -634,6 +1202,14 @@ main() {
     case "${1:-}" in
         --help|-h)
             show_help
+            exit 0
+            ;;
+        --version|-v)
+            echo "$APP_NAME v$APP_VERSION"
+            exit 0
+            ;;
+        --doctor|doctor)
+            show_doctor
             exit 0
             ;;
         --install|install)
