@@ -64,6 +64,4 @@ If the shortcut is deleted or broken:
 sudo haproxy-menu --repair-shortcut
 ```
 
-### Menu
 
-![Menu](https://github.com/Musixal/haproxy/blob/main/menu.png)
