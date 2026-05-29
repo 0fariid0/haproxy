@@ -13,7 +13,7 @@ sudo bash haproxy.sh --install
 If you are installing from GitHub for the first time:
 
 ```bash
-sudo bash <(curl -Ls --ipv4 https://github.com/0fariid0/haproxy/raw/main/haproxy.sh) --install
+curl -4 -fsSL https://raw.githubusercontent.com/0fariid0/haproxy/main/haproxy.sh -o /tmp/haproxy.sh && bash /tmp/haproxy.sh --install
 ```
 
 After the first install, open the menu any time with:
